@@ -153,16 +153,71 @@ public final class HBStorage {
     // MARK: - Anchor Operations
 
     /// Saves an anchor to storage
+    /// Now also appends versioning events
     /// - Parameter anchor: The anchor to save
     /// - Throws: HBStorageError if save fails
     public func save(_ anchor: HBAnchor) async throws {
-        // Save locally
+        // Check if anchor exists
+        let existingAnchor = try localStore.loadAnchor(id: anchor.id)
+        var currentVersion = try localStore.currentVersion(anchorId: anchor.id, spaceId: anchor.spaceId)
+
+        // MIGRATION: Seed event history for existing anchors from Phase 1
+        // If anchor exists but has no event history, create initial "created" event
+        if let existing = existingAnchor, currentVersion == 0 {
+            let seedEvent = HBAnchorEvent(
+                anchorId: existing.id,
+                spaceId: existing.spaceId,
+                type: .created,
+                timestamp: existing.createdAt,  // Use original creation date
+                version: 1,
+                transform: existing.transform,
+                metadata: existing.metadata
+            )
+            try localStore.appendEvent(seedEvent)
+            currentVersion = 1  // Update for subsequent change detection
+        }
+
+        // Determine event type
+        let event: HBAnchorEvent?
+
+        if let existing = existingAnchor {
+            // Anchor exists - determine what changed
+            if existing.deletedAt != nil && anchor.deletedAt == nil {
+                // Restoring from deletion
+                event = .restored(anchor: anchor, previousVersion: currentVersion)
+            } else if anchor.deletedAt != nil && existing.deletedAt == nil {
+                // Deleting
+                event = .deleted(anchor: anchor, previousVersion: currentVersion)
+            } else if existing.transform != anchor.transform {
+                // Transform changed
+                event = .moved(anchor: anchor, previousVersion: currentVersion)
+            } else if existing.metadata != anchor.metadata {
+                // Metadata changed
+                event = .updated(anchor: anchor, previousVersion: currentVersion)
+            } else {
+                // No changes - just save without event
+                event = nil
+            }
+        } else {
+            // New anchor
+            event = .created(anchor: anchor)
+        }
+
+        // Append event if there was a change
+        if let event = event {
+            try localStore.appendEvent(event)
+        }
+
+        // Save current state
         try localStore.saveAnchor(anchor)
 
         // Sync to cloud if configured
         if config.syncStrategy == .onSave, let cloudStore = cloudStore {
             do {
                 try await cloudStore.uploadAnchor(anchor)
+                if let event = event {
+                    try await cloudStore.uploadEvent(event)
+                }
             } catch {
                 queueOperation(.saveAnchor(anchor.id))
                 throw HBStorageError.cloudSyncFailed(underlying: error)
@@ -373,6 +428,133 @@ public final class HBStorage {
     /// Returns the total size of local storage in bytes
     public func localStorageSize() throws -> Int {
         try localStore.totalSize()
+    }
+
+    // MARK: - Versioning API
+
+    /// Get the full timeline for a space
+    /// - Parameter spaceId: The space to get timeline for
+    /// - Returns: Timeline with all events
+    public func timeline(spaceId: UUID) async throws -> HBTimeline {
+        let events = try localStore.loadEvents(spaceId: spaceId)
+        return HBTimeline(spaceId: spaceId, events: events)
+    }
+
+    /// Get anchors as they existed at a specific point in time
+    /// - Parameters:
+    ///   - spaceId: The space to query
+    ///   - date: The point in time to reconstruct
+    /// - Returns: Anchors as they existed at that date
+    public func anchorsAt(spaceId: UUID, date: Date) async throws -> [HBAnchor] {
+        let timeline = try await timeline(spaceId: spaceId)
+        return timeline.state(at: date)
+    }
+
+    /// Get the difference between two points in time
+    /// - Parameters:
+    ///   - spaceId: The space to diff
+    ///   - from: Start date
+    ///   - to: End date
+    /// - Returns: Diff describing all changes
+    public func diff(spaceId: UUID, from: Date, to: Date) async throws -> HBDiff {
+        let timeline = try await timeline(spaceId: spaceId)
+        return timeline.diff(from: from, to: to)
+    }
+
+    /// Get the history of changes for a specific anchor
+    /// - Parameter anchorId: The anchor to get history for
+    /// - Returns: Array of events in chronological order
+    public func history(anchorId: UUID) async throws -> [HBAnchorEvent] {
+        let anchor = try localStore.loadAnchor(id: anchorId)
+        guard let anchor = anchor else {
+            throw HBStorageError.notFound(type: "anchor", id: anchorId)
+        }
+
+        let allEvents = try localStore.loadEvents(spaceId: anchor.spaceId)
+        return allEvents
+            .filter { $0.anchorId == anchorId }
+            .sorted { $0.timestamp < $1.timestamp }
+    }
+
+    /// Rollback an anchor to a previous version
+    /// - Parameters:
+    ///   - anchorId: The anchor to rollback
+    ///   - toVersion: The version number to restore
+    /// - Returns: The restored anchor
+    @discardableResult
+    public func rollback(anchorId: UUID, toVersion: Int) async throws -> HBAnchor {
+        let events = try await history(anchorId: anchorId)
+
+        // Find the event with the target version
+        guard events.contains(where: { $0.version == toVersion }) else {
+            throw HBStorageError.versionNotFound(anchorId: anchorId, version: toVersion)
+        }
+
+        // Reconstruct state at that version
+        let relevantEvents = events.filter { $0.version <= toVersion }
+        guard let state = reconstructAnchor(from: relevantEvents) else {
+            throw HBStorageError.reconstructionFailed(anchorId: anchorId)
+        }
+
+        // Create and save the restored anchor
+        var restored = state
+        restored.restore() // Clear deletedAt if set
+
+        // Get current version for the new event
+        let currentVersion = events.map(\.version).max() ?? 0
+
+        // Append restore event
+        let event = HBAnchorEvent.restored(anchor: restored, previousVersion: currentVersion)
+        try localStore.appendEvent(event)
+
+        // Update current anchor state
+        try localStore.saveAnchor(restored)
+
+        return restored
+    }
+
+    // MARK: - Private Versioning Helpers
+
+    private func reconstructAnchor(from events: [HBAnchorEvent]) -> HBAnchor? {
+        guard let firstEvent = events.first, firstEvent.type == .created else {
+            return nil
+        }
+
+        var transform = firstEvent.transform ?? []
+        var metadata = firstEvent.metadata ?? [:]
+        var isDeleted = false
+        var updatedAt = firstEvent.timestamp
+
+        for event in events.dropFirst() {
+            switch event.type {
+            case .created:
+                break // Shouldn't happen
+            case .moved:
+                transform = event.transform ?? transform
+                updatedAt = event.timestamp
+            case .updated:
+                metadata = event.metadata ?? metadata
+                updatedAt = event.timestamp
+            case .deleted:
+                isDeleted = true
+                updatedAt = event.timestamp
+            case .restored:
+                transform = event.transform ?? transform
+                metadata = event.metadata ?? metadata
+                isDeleted = false
+                updatedAt = event.timestamp
+            }
+        }
+
+        return HBAnchor(
+            id: firstEvent.anchorId,
+            spaceId: firstEvent.spaceId,
+            transform: transform,
+            metadata: metadata,
+            createdAt: firstEvent.timestamp,
+            updatedAt: updatedAt,
+            deletedAt: isDeleted ? updatedAt : nil
+        )
     }
 }
 

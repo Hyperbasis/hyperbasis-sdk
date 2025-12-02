@@ -43,6 +43,17 @@ public enum HBStorageError: LocalizedError {
     /// Data decoding failed
     case decodingFailed(underlying: Error)
 
+    // MARK: - Versioning Errors
+
+    /// Version not found for anchor
+    case versionNotFound(anchorId: UUID, version: Int)
+
+    /// Failed to reconstruct anchor from event history
+    case reconstructionFailed(anchorId: UUID)
+
+    /// Event log is corrupted
+    case eventLogCorrupted(spaceId: UUID)
+
     public var errorDescription: String? {
         switch self {
         case .notFound(let type, let id):
@@ -70,6 +81,12 @@ public enum HBStorageError: LocalizedError {
             return "Failed to encode data: \(underlying.localizedDescription)"
         case .decodingFailed(let underlying):
             return "Failed to decode data: \(underlying.localizedDescription)"
+        case .versionNotFound(let anchorId, let version):
+            return "Version \(version) not found for anchor \(anchorId)"
+        case .reconstructionFailed(let anchorId):
+            return "Failed to reconstruct anchor \(anchorId) from event history"
+        case .eventLogCorrupted(let spaceId):
+            return "Event log for space \(spaceId) is corrupted"
         }
     }
 }

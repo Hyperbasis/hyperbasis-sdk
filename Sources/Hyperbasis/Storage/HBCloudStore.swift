@@ -150,6 +150,24 @@ final class HBCloudStore {
         )
     }
 
+    // MARK: - Event Operations
+
+    func uploadEvent(_ event: HBAnchorEvent) async throws {
+        let row = EventRow(
+            id: event.id,
+            anchorId: event.anchorId,
+            spaceId: event.spaceId,
+            type: event.type.rawValue,
+            timestamp: event.timestamp,
+            version: event.version,
+            transform: event.transform,
+            metadata: event.metadata,
+            actorId: event.actorId
+        )
+
+        try await upsert(table: "anchor_events", data: row)
+    }
+
     // MARK: - Supabase Helpers (TODO: Implement with actual SDK)
 
     private func uploadBlob(data: Data, path: String) async throws {
@@ -388,5 +406,29 @@ private struct AnchorRow: Codable {
         case createdAt = "created_at"
         case updatedAt = "updated_at"
         case deletedAt = "deleted_at"
+    }
+}
+
+private struct EventRow: Codable {
+    let id: UUID
+    let anchorId: UUID
+    let spaceId: UUID
+    let type: String
+    let timestamp: Date
+    let version: Int
+    let transform: [Float]?
+    let metadata: [String: AnyCodableValue]?
+    let actorId: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case anchorId = "anchor_id"
+        case spaceId = "space_id"
+        case type
+        case timestamp
+        case version
+        case transform
+        case metadata
+        case actorId = "actor_id"
     }
 }

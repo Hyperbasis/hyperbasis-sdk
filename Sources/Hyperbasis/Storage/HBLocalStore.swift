@@ -42,6 +42,7 @@ final class HBLocalStore {
         try fm.createDirectory(at: spacesDirectory, withIntermediateDirectories: true)
         try fm.createDirectory(at: anchorsDirectory, withIntermediateDirectories: true)
         try fm.createDirectory(at: worldMapsDirectory, withIntermediateDirectories: true)
+        try fm.createDirectory(at: eventsDirectory, withIntermediateDirectories: true)
     }
 
     // MARK: - Directory Paths
@@ -56,6 +57,10 @@ final class HBLocalStore {
 
     private var worldMapsDirectory: URL {
         baseDirectory.appendingPathComponent("worldmaps", isDirectory: true)
+    }
+
+    private var eventsDirectory: URL {
+        baseDirectory.appendingPathComponent("events", isDirectory: true)
     }
 
     private var pendingOperationsFile: URL {
@@ -256,6 +261,102 @@ final class HBLocalStore {
         }
 
         return size
+    }
+
+    // MARK: - Event Storage
+
+    /// Directory for event logs of a specific space
+    private func eventsDirectory(spaceId: UUID) -> URL {
+        eventsDirectory.appendingPathComponent(spaceId.uuidString, isDirectory: true)
+    }
+
+    /// Event log file for a space (JSONL format)
+    private func eventLogURL(spaceId: UUID) -> URL {
+        eventsDirectory(spaceId: spaceId).appendingPathComponent("events.jsonl")
+    }
+
+    // MARK: - Write Events
+
+    /// Append an event to the log (append-only)
+    func appendEvent(_ event: HBAnchorEvent) throws {
+        let fm = FileManager.default
+        let directory = eventsDirectory(spaceId: event.spaceId)
+        try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let logURL = eventLogURL(spaceId: event.spaceId)
+
+        // Encode event as single JSON line
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(event)
+
+        guard var line = String(data: data, encoding: .utf8) else {
+            throw HBStorageError.encodingFailed(underlying: NSError(
+                domain: "HBLocalStore",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to convert event data to string"]
+            ))
+        }
+        line += "\n"
+
+        // Append to file
+        if fm.fileExists(atPath: logURL.path) {
+            let handle = try FileHandle(forWritingTo: logURL)
+            handle.seekToEndOfFile()
+            if let lineData = line.data(using: .utf8) {
+                handle.write(lineData)
+            }
+            try handle.close()
+        } else {
+            try line.write(to: logURL, atomically: true, encoding: .utf8)
+        }
+    }
+
+    // MARK: - Read Events
+
+    /// Load all events for a space
+    func loadEvents(spaceId: UUID) throws -> [HBAnchorEvent] {
+        let logURL = eventLogURL(spaceId: spaceId)
+
+        guard FileManager.default.fileExists(atPath: logURL.path) else {
+            return []
+        }
+
+        let content = try String(contentsOf: logURL, encoding: .utf8)
+        let lines = content.components(separatedBy: .newlines).filter { !$0.isEmpty }
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+
+        return try lines.map { line in
+            guard let data = line.data(using: .utf8) else {
+                throw HBStorageError.decodingFailed(underlying: NSError(
+                    domain: "HBLocalStore",
+                    code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "Failed to convert line to data"]
+                ))
+            }
+            return try decoder.decode(HBAnchorEvent.self, from: data)
+        }
+    }
+
+    /// Load events for a specific anchor
+    func loadEvents(anchorId: UUID, spaceId: UUID) throws -> [HBAnchorEvent] {
+        try loadEvents(spaceId: spaceId).filter { $0.anchorId == anchorId }
+    }
+
+    /// Get the current version number for an anchor
+    func currentVersion(anchorId: UUID, spaceId: UUID) throws -> Int {
+        let events = try loadEvents(anchorId: anchorId, spaceId: spaceId)
+        return events.map(\.version).max() ?? 0
+    }
+
+    /// Delete event log for a space
+    func deleteEvents(spaceId: UUID) throws {
+        let directory = eventsDirectory(spaceId: spaceId)
+        if FileManager.default.fileExists(atPath: directory.path) {
+            try FileManager.default.removeItem(at: directory)
+        }
     }
 }
 
